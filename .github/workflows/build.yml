@@ -40,132 +40,16 @@ jobs:
       - run: dart analyze lib test integration_test test_driver
         continue-on-error: true
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      # 测试当前不阻塞出包（开发优先、集中验证暂缓），结果仍会显示在运行详情里。
-      - run: flutter test --dart-define=DISABLE_REMOTE_IMAGES=true
-        continue-on-error: true
       - run: flutter test --dart-define=DISABLE_REMOTE_IMAGES=true --dart-define=ALL_SOURCES=true
-        continue-on-error: true
-      - run: go test -race ./...
-        working-directory: native
         continue-on-error: true
       - run: go test -race -ldflags="-X duanjuapp/native/core.buildAllSources=true" ./...
         working-directory: native
         continue-on-error: true
 
-  android:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - edition: hongguojian
-            arguments: ''
-          - edition: zhenguojian
-            arguments: '--all-sources'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: native/go.mod
-          cache-dependency-path: native/go.sum
-      - uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.47.4'
-          channel: stable
-          cache: true
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: "platforms;android-36"
-          accept-android-sdk-licenses: true
-      - run: sdkmanager 'ndk;28.2.13676358'
-      - name: Configure Android signing
-        id: signing
-        run: |
-          python scripts/configure_signing.py
-          if [ -f android/key.properties ]; then
-            echo "release=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "release=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::未配置发布签名 Secrets，本次 APK 使用 debug 签名，仅供测试，不可用于正式分发。"
-          fi
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-      - run: python scripts/build_android.py ${{ matrix.arguments }}
-      - name: 校验 APK 签名证书
-        if: steps.signing.outputs.release == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected='${{ vars.ANDROID_CERT_SHA256 }}'
-          if [ -z "$expected" ]; then
-            echo "未设置仓库变量 ANDROID_CERT_SHA256，跳过证书指纹比对。" >&2
-            exit 0
-          fi
-          apksigner=$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f 2>/dev/null | sort | tail -n1 || true)
-          if [ -z "$apksigner" ]; then
-            sdkmanager 'build-tools;35.0.0' >/dev/null
-            apksigner=$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f | sort | tail -n1)
-          fi
-          echo "apksigner：$apksigner"
-          "$apksigner" --version || true
-          for apk in dist/android/*.apk; do
-            echo "== $(basename "$apk")"
-            output=$("$apksigner" verify --print-certs "$apk" 2>&1 || true)
-            printf '%s\n' "$output"
-            if ! printf '%s' "$output" | tr -d ':' | tr '[:upper:]' '[:lower:]' | grep -q "$expected"; then
-              echo "签名证书与发布证书不一致，已终止。" >&2
-              exit 1
-            fi
-          done
-      - name: Remove signing files
-        if: always()
-        run: python scripts/configure_signing.py --clean
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.edition }}-android
-          path: dist/android/*
-          if-no-files-found: error
-          retention-days: 14
-  windows:
-    if: false
-    needs: checks
-    runs-on: windows-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - edition: hongguojian
-            arguments: ''
-          - edition: zhenguojian
-            arguments: '--all-sources'
-    steps:
-      - uses: actions/checkout@v4
-
   ios:
     needs: checks
     runs-on: macos-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - edition: hongguojian
-            arguments: ''
-          - edition: zhenguojian
-            arguments: '--all-sources'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -195,21 +79,21 @@ jobs:
           go version
           flutter --version
           flutter precache --ios
-      - name: Build unsigned iOS packages
-        run: python scripts/build_ios.py ${{ matrix.arguments }}
+      - name: Build unsigned iOS packages (zhenguojian only)
+        run: python scripts/build_ios.py --all-sources
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.edition }}-ios-unsigned
+          name: zhenguojian-ios-unsigned
           path: dist/ios/*
           if-no-files-found: error
           retention-days: 14
 
   release:
-    needs: [android, ios]
+    needs: [ios]
     if: >-
       always() && github.event_name != 'pull_request' &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) &&
-      needs.android.result == 'success' && needs.ios.result == 'success'
+      needs.ios.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -235,10 +119,7 @@ jobs:
               cp "$file" "release/$name"
             done
           done
-          for edition in hongguojian zhenguojian; do
-            test -s "release/${edition}-${version}-ios-unsigned.ipa"
-            test -s "release/${edition}-${version}-arm64-v8a.apk"
-          done
+          test -s "release/zhenguojian-${version}-ios-unsigned.ipa"
           cd release
           mapfile -t files < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
           sha256sum "${files[@]}" > SHA256SUMS.txt
@@ -250,44 +131,17 @@ jobs:
           set -euo pipefail
           version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1)
           tag="app-v${version//+/-}"
-          apk_note="Android（已用固定发布证书签名，可覆盖安装升级，无需卸载）："
-          if printf '%s\n' "${{ vars.ANDROID_CERT_SHA256 }}" | grep -q .; then
-            apk_note="Android（已用固定发布证书签名，可覆盖安装升级，无需卸载）："
-          else
-            apk_note="Android（未配置发布签名，当前为 debug 签名，仅供测试，不能覆盖正式版安装）："
-          fi
           {
-            printf '%s\n\n' "版本 ${version}。两个版本功能相同，区别只在站源范围，按需选择："
-            printf '%s\n' "- 红果鉴 hongguojian：仅红果站源"
-            printf '%s\n' "- 真果鉴 zhenguojian：全部站源"
-            printf '\n%s\n' "$apk_note"
-            printf '%s\n' "- *-arm64-v8a.apk：绝大多数手机选这个"
-            printf '%s\n' "- *-armeabi-v7a.apk：较老的 32 位手机"
-            printf '%s\n' "- *-x86_64.apk：模拟器"
-            printf '\n%s\n' "iOS（未签名，需自行签名后才能安装）："
-            printf '%s\n' "- *-ios-unsigned.ipa：未签名 IPA，用 AltStore / Sideloadly / TrollStore 等工具自签后安装"
-            printf '%s\n' "- *-ios-unsigned-app.zip：未签名 Runner.app 压缩包，供自行签名 / 打包使用"
-            printf '\n%s\n' "开发快照：CI 构建通过不代表真机播放验收通过，iOS 需复测。"
-            printf '%s\n' "安卓播放修复参考 Xanerix/guoapp 的 6afdc6e5b25536352b280ff0f953e37a73a16476；电视解码设置参考 b1a9b82ab6ccf4cbc92899b7f377f68d6552bdc8。"
-            printf '%s\n' "朋友维护的安卓版本：https://github.com/Xanerix/guoapp/releases"
+            printf '%s\n\n' "版本 ${version}（真果鉴 iOS 全站源未签名版）："
+            printf '%s\n' "- 包含全部站源（真果鉴）"
+            printf '\n%s\n' "iOS 安装说明："
+            printf '%s\n' "- zhenguojian-${version}-ios-unsigned.ipa：未签名 IPA，使用 SideStore / AltStore / Sideloadly / TrollStore 等签名工具安装"
+            printf '%s\n' "- zhenguojian-${version}-ios-unsigned-app.zip：未签名 Runner.app 归档"
             printf '\n%s\n' "校验：SHA256SUMS.txt"
-            if printf '%s\n' "${{ vars.ANDROID_CERT_SHA256 }}" | grep -q .; then
-              printf '%s\n' "签名证书 SHA-256：${{ vars.ANDROID_CERT_SHA256 }}"
-            else
-              printf '%s\n' "签名证书：未配置（当前为 debug 签名）"
-            fi
           } > notes.md
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" release/* --clobber
-            gh release edit "$tag" --prerelease --title "红果鉴 / 真果鉴 ${version}" --notes-file notes.md
+            gh release edit "$tag" --prerelease --title "真果鉴 iOS ${version}" --notes-file notes.md
           else
-            gh release create "$tag" release/* --target "$GITHUB_SHA" --prerelease --title "红果鉴 / 真果鉴 ${version}" --notes-file notes.md
-          fi
-          old_tag=app-v0.2.68-75
-          if gh release view "$old_tag" --json body --jq '.body' > old-notes.md && ! grep -q '此旧版本 Android 播放链路' old-notes.md; then
-            {
-              printf '%s\n\n' '> 已知问题：此旧版本 Android 播放链路未包含 Xanerix 的解密修复，暂不推荐下载。请使用本仓库更新的开发快照，或 https://github.com/Xanerix/guoapp/releases 的安卓版本。'
-              cat old-notes.md
-            } > old-notes-updated.md
-            gh release edit "$old_tag" --notes-file old-notes-updated.md
+            gh release create "$tag" release/* --target "$GITHUB_SHA" --prerelease --title "真果鉴 iOS ${version}" --notes-file notes.md
           fi
